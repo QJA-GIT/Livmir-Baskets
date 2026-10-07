@@ -32,7 +32,7 @@ def apply_financial_theme(fig, title=""):
         paper_bgcolor="rgba(15, 17, 23, 0)",
         plot_bgcolor="rgba(15, 17, 23, 0)",
         font=dict(family="Inter, sans-serif", size=12, color="#B0B3C6"),
-        margin=dict(l=20, r=20, t=90, b=30),  # Expanded top margin gives titles and legends breathing room
+        margin=dict(l=20, r=20, t=90, b=30),
         legend=dict(
             orientation="h",
             yanchor="bottom",
@@ -53,9 +53,14 @@ def apply_financial_theme(fig, title=""):
     return fig
 
 # ==========================================
-# 2. API KEY CONFIGURATION
+# 2. API KEY & LOGO CONFIGURATION
 # ==========================================
 st.sidebar.title("⚙️ Configuration")
+
+# Render Sidebar Logo
+if os.path.exists("logo.png"):
+    st.sidebar.image("logo.png", use_container_width=True)
+
 api_key_input = st.sidebar.text_input(
     "Sectors API Key", 
     type="password", 
@@ -136,16 +141,16 @@ def fetch_company_report(ticker: str):
         pass
     return {}
 
-# Keyword mappings for search expansion
+# Structured keyword map for sector multi-intent extraction
 ALIAS_MAP = {
-    "bank": ["financials", "bank", "finance", "lending"],
-    "banking": ["financials", "bank", "finance"],
+    "bank": ["financials", "bank", "banking", "finance", "lending"],
+    "banking": ["financials", "bank", "banking", "finance"],
     "finance": ["financials", "finance"],
     "financial": ["financials", "finance"],
     "tech": ["technology", "tech", "digital", "software"],
     "technology": ["technology", "software"],
     "mining": ["energy", "basic materials", "mining", "coal", "mineral"],
-    "energy": ["energy", "coal", "oil", "gas"],
+    "energy": ["energy", "coal", "oil", "gas", "mining"],
     "food": ["consumer non-cyclicals", "consumer cyclicals", "food", "fmcg", "beverage", "staples"],
     "consumer": ["consumer non-cyclicals", "consumer cyclicals", "consumer", "retail"],
     "telecom": ["infrastructures", "telecommunication", "cellular", "tower"],
@@ -155,37 +160,78 @@ ALIAS_MAP = {
 }
 
 def filter_companies_by_query(df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Filters dataframe rows based on query keywords."""
+    """Smart multi-intent query filter targeting exact tickers, sector maps, or strict word intersections."""
     if df.empty or not query.strip():
         return df
     
     clean_query = query.lower().strip()
-    words = [w for w in clean_query.split() if w not in ["and", "or", "the", "in", "fast", "growing", "companies", "top", "best"]]
+    ticker_col = next((c for c in ["symbol", "code", "ticker"] if c in df.columns), None)
     
-    if not words:
+    # 1. Direct Ticker / Symbol Match
+    if ticker_col:
+        exact_ticker_mask = df[ticker_col].astype(str).str.lower() == clean_query
+        if exact_ticker_mask.any():
+            return df[exact_ticker_mask]
+
+    # Stopwords filter
+    stopwords = {"and", "or", "the", "in", "fast", "growing", "companies", "top", "best", "stock", "stocks", "etf", "basket"}
+    raw_words = [w for w in clean_query.split() if w not in stopwords]
+    
+    if not raw_words:
         return df
 
-    search_tokens = set(words)
-    for w in words:
-        if w in ALIAS_MAP:
-            search_tokens.update(ALIAS_MAP[w])
+    # 2. Extract Distinct Sector Intents (e.g. "mining and food" -> Intent 1: Mining, Intent 2: Food)
+    matched_intents = []
+    unmapped_words = []
+    
+    for w in raw_words:
+        mapped = False
+        for alias_key, keywords in ALIAS_MAP.items():
+            if w in keywords or w == alias_key:
+                matched_intents.append(set(keywords + [alias_key]))
+                mapped = True
+                break
+        if not mapped:
+            unmapped_words.append(w)
 
-    text_cols = [c for c in df.columns if df[c].dtype == object or isinstance(df[c].dtype, pd.StringDtype)]
-    if not text_cols:
-        return df
+    sector_cols = [c for c in ["sector", "subsector", "industry"] if c in df.columns]
+    target_text_cols = sector_cols if sector_cols else [c for c in ["symbol", "name"] if c in df.columns]
 
-    masks = []
-    for token in search_tokens:
-        token_mask = pd.Series(False, index=df.index)
-        for col in text_cols:
-            token_mask |= df[col].astype(str).str.lower().str.contains(token, na=False)
-        masks.append(token_mask)
+    # If distinct sector intents are recognized, pull candidates from EACH intent group
+    if matched_intents:
+        intent_dfs = []
+        for intent_tokens in matched_intents:
+            intent_mask = pd.Series(False, index=df.index)
+            for token in intent_tokens:
+                for col in target_text_cols:
+                    intent_mask |= df[col].astype(str).str.lower().str.contains(token, na=False)
+            if intent_mask.any():
+                intent_dfs.append(df[intent_mask])
+        
+        if intent_dfs:
+            return pd.concat(intent_dfs).drop_duplicates(subset=[ticker_col] if ticker_col else None)
 
-    if masks:
-        combined_mask = pd.concat(masks, axis=1).any(axis=1)
-        filtered = df[combined_mask]
-        if not filtered.empty:
-            return filtered
+    # 3. Strict Word Intersection (AND logic) for unmapped terms
+    search_words = unmapped_words if unmapped_words else raw_words
+    word_masks = []
+    all_text_cols = [c for c in ["symbol", "name", "sector", "subsector"] if c in df.columns]
+    
+    for word in search_words:
+        w_mask = pd.Series(False, index=df.index)
+        for col in all_text_cols:
+            w_mask |= df[col].astype(str).str.lower().str.contains(word, na=False)
+        word_masks.append(w_mask)
+
+    if word_masks:
+        # Require ALL words to match somewhere in company metadata
+        and_mask = pd.concat(word_masks, axis=1).all(axis=1)
+        if and_mask.any():
+            return df[and_mask]
+        
+        # Fallback to OR match if strict intersection returns zero
+        or_mask = pd.concat(word_masks, axis=1).any(axis=1)
+        if or_mask.any():
+            return df[or_mask]
 
     return df
 
@@ -293,8 +339,19 @@ def build_portfolio_basket(all_companies: list, query: str, capital_idr: float, 
 # ==========================================
 # 5. STREAMLIT APPLICATION UI
 # ==========================================
-st.title("📈 Livmir Baskets")
-st.caption("AI-Powered Thematic ETF & Portfolio Allocator (Sectors API v2 Engine)")
+
+# Header Layout with Custom Logo Support
+col_logo, col_title = st.columns([1, 6])
+
+with col_logo:
+    if os.path.exists("logo.png"):
+        st.image("logo.png", width=90)
+    else:
+        st.title("📈")
+
+with col_title:
+    st.title("Livmir Baskets")
+    st.caption("AI-Powered Thematic ETF & Portfolio Allocator (Sectors API v2 Engine)")
 
 # Fetch Company Universe
 with st.spinner("Connecting to Sectors API v2..."):
